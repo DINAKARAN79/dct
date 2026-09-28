@@ -1,0 +1,261 @@
+"use client";
+
+import * as React from "react";
+import Link from "next/link";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Skeleton } from "@/components/ui/skeleton";
+import { FieldDisplay, FieldDefinition } from "./field-renderer";
+import {
+  ArrowLeft,
+  Edit,
+  Trash2,
+  Calendar,
+  User,
+  FileText,
+  History,
+} from "lucide-react";
+
+interface PageLayout {
+  name: string;
+  sections: { name: string; fields: string[] }[];
+}
+
+interface DynamicDetailProps {
+  objectName: string;
+  objectLabel: string;
+  pluralLabel: string;
+  fields: FieldDefinition[];
+  layout?: PageLayout;
+  record: any;
+  isLoading?: boolean;
+  onEdit?: () => void;
+  onDelete?: () => void;
+  canUpdate?: boolean;
+  canDelete?: boolean;
+  basePath?: string;
+  relatedLists?: {
+    name: string;
+    label: string;
+    objectName: string;
+    foreignKey: string;
+  }[];
+}
+
+export function DynamicDetail({
+  objectName,
+  objectLabel,
+  pluralLabel,
+  fields,
+  layout,
+  record,
+  isLoading = false,
+  onEdit,
+  onDelete,
+  canUpdate = false,
+  canDelete = false,
+  basePath,
+  relatedLists,
+}: DynamicDetailProps) {
+  if (isLoading) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-4">
+          <Skeleton className="h-10 w-10" />
+          <div className="space-y-2">
+            <Skeleton className="h-8 w-64" />
+            <Skeleton className="h-4 w-32" />
+          </div>
+        </div>
+        <div className="grid gap-6 md:grid-cols-2">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Card key={i}>
+              <CardContent className="p-6">
+                <Skeleton className="h-20 w-full" />
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (!record) {
+    return (
+      <div className="text-center py-12">
+        <p className="text-muted-foreground">Record not found</p>
+      </div>
+    );
+  }
+
+  const displayFields = fields.filter(
+    (f) =>
+      f.visible &&
+      !["id", "is_active", "created_by", "updated_at"].includes(f.name)
+  );
+
+  let parsedSections: { name: string; fields: string[] }[] = [];
+  if (layout?.sections) {
+    if (Array.isArray(layout.sections)) {
+      parsedSections = layout.sections;
+    } else if (typeof layout.sections === "string") {
+      try {
+        const parsed = JSON.parse(layout.sections);
+        if (Array.isArray(parsed)) {
+          parsedSections = parsed;
+        }
+      } catch (e) {
+        console.warn("Failed to parse layout sections:", e);
+      }
+    }
+  }
+
+  const sections = parsedSections.length > 0 ? parsedSections : [
+    {
+      name: "Details",
+      fields: displayFields.filter(
+        (f) =>
+          !["record_number", "owner", "created_at"].includes(f.name)
+      ).map((f) => f.name),
+    },
+    {
+      name: "System Information",
+      fields: ["record_number", "owner", "created_at"],
+    },
+  ];
+
+  const systemFields = fields.filter(
+    (f) =>
+      f.isSystemField ||
+      ["record_number", "owner", "created_by", "created_at", "updated_at"].includes(f.name)
+  );
+
+  const customFields = fields.filter(
+    (f) =>
+      !f.isSystemField &&
+      !["id", "record_number", "owner", "created_by", "created_at", "updated_at", "is_active"].includes(f.name)
+  );
+
+  const getFieldByName = (name: string) =>
+    fields.find((f) => f.name === name);
+
+  const renderSection = (section: { name: string; fields: string[] }) => {
+    const sectionFields = section.fields
+      .map(getFieldByName)
+      .filter((f): f is FieldDefinition => !!f && !f.isSystemField);
+
+    if (sectionFields.length === 0) return null;
+
+    return (
+      <Card key={section.name}>
+        <CardHeader>
+          <CardTitle className="text-sm font-medium text-muted-foreground">
+            {section.name}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 md:grid-cols-2">
+            {sectionFields.map((field) => (
+              <div
+                key={field.id}
+                className={
+                  field.fieldType === "longText" ? "md:col-span-2" : ""
+                }
+              >
+                <FieldDisplay
+                  field={field}
+                  value={record.data?.[field.name] ?? record[field.name]}
+                />
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    );
+  };
+
+  const recordTitle =
+    record.data?.name ||
+    record.data?.title ||
+    record.data?.label ||
+    record.recordNumber ||
+    record.id;
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          {basePath && (
+            <Button variant="ghost" size="icon" asChild>
+              <Link href={basePath}>
+                <ArrowLeft className="h-5 w-5" />
+              </Link>
+            </Button>
+          )}
+          <div>
+            <h1 className="text-2xl font-bold">{recordTitle}</h1>
+            <p className="text-muted-foreground">
+              {objectLabel}
+              {record.recordNumber && ` • ${record.recordNumber}`}
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          {canUpdate && (
+            <Button variant="outline" onClick={onEdit}>
+              <Edit className="mr-2 h-4 w-4" />
+              Edit
+            </Button>
+          )}
+          {canDelete && (
+            <Button variant="destructive" onClick={onDelete}>
+              <Trash2 className="mr-2 h-4 w-4" />
+              Delete
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <Tabs defaultValue="details" className="space-y-4">
+        <TabsList>
+          <TabsTrigger value="details" className="gap-2">
+            <FileText className="h-4 w-4" />
+            Details
+          </TabsTrigger>
+          {relatedLists && relatedLists.length > 0 && (
+            <TabsTrigger value="related" className="gap-2">
+              <History className="h-4 w-4" />
+              Related
+            </TabsTrigger>
+          )}
+        </TabsList>
+
+        <TabsContent value="details" className="space-y-6">
+          {sections.map((section) => renderSection(section))}
+        </TabsContent>
+
+        {relatedLists && relatedLists.length > 0 && (
+          <TabsContent value="related" className="space-y-6">
+            {relatedLists.map((rl) => (
+              <Card key={rl.name}>
+                <CardHeader>
+                  <CardTitle className="text-sm font-medium">
+                    {rl.label}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <p className="text-sm text-muted-foreground">
+                    Related records will be displayed here
+                  </p>
+                </CardContent>
+              </Card>
+            ))}
+          </TabsContent>
+        )}
+      </Tabs>
+    </div>
+  );
+}

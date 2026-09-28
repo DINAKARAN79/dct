@@ -1,0 +1,251 @@
+import { Router, Response } from 'express';
+import { prisma } from '@dct-crm/db';
+import { z } from 'zod';
+import { authenticate, AuthRequest } from '../middleware/auth';
+import { authorize } from '../middleware/authorization';
+import { auditLog } from '../middleware/audit';
+
+const router = Router();
+
+router.use(authenticate);
+
+const opportunitySchema = z.object({
+  name: z.string().min(1).max(200),
+  leadId: z.string().optional(),
+  ownerId: z.string().optional(),
+  queueId: z.string().optional(),
+  projectId: z.string().optional(),
+  stage: z.enum(['PROSPECTING', 'QUALIFICATION', 'PROPOSAL', 'NEGOTIATION', 'CLOSED_WON', 'CLOSED_LOST']).optional(),
+  amount: z.number().min(0).optional(),
+  expectedCloseDate: z.string().datetime().optional(),
+  probability: z.number().min(0).max(100).optional(),
+  description: z.string().max(2000).optional(),
+  lostReason: z.string().max(500).optional(),
+});
+
+const updateOpportunitySchema = opportunitySchema.partial();
+
+router.get('/', authorize('Opportunity', 'read'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { tenantId } = req.user!;
+    const {
+      page = 1,
+      limit = 20,
+      search,
+      stage,
+      leadId,
+      ownerId,
+      projectId,
+      minAmount,
+      maxAmount,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+    } = req.query;
+
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const where: any = { tenantId };
+    if (stage) where.stage = stage;
+    if (leadId) where.leadId = leadId;
+    if (ownerId) where.ownerId = ownerId;
+    if (projectId) where.projectId = projectId;
+    if (minAmount) where.amount = { ...where.amount, gte: Number(minAmount) };
+    if (maxAmount) where.amount = { ...where.amount, lte: Number(maxAmount) };
+    if (search) {
+      where.OR = [
+        { name: { contains: search as string, mode: 'insensitive' } },
+        { description: { contains: search as string, mode: 'insensitive' } },
+      ];
+    }
+
+    const [opportunities, total] = await Promise.all([
+      prisma.opportunity.findMany({
+        where,
+        skip,
+        take: Number(limit),
+        orderBy: { [sortBy as string]: sortOrder },
+        include: {
+          lead: { select: { id: true, firstName: true, lastName: true } },
+          owner: { select: { id: true, firstName: true, lastName: true } },
+          creator: { select: { id: true, firstName: true, lastName: true } },
+          project: { select: { id: true, name: true } },
+          _count: { select: { quotations: true, bookings: true, activities: true } },
+        },
+      }),
+      prisma.opportunity.count({ where }),
+    ]);
+
+    res.json({
+      success: true,
+      data: opportunities,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        totalPages: Math.ceil(total / Number(limit)),
+      },
+    });
+  } catch (error) {
+    console.error('Get opportunities error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch opportunities' });
+  }
+});
+
+router.get('/:id', authorize('Opportunity', 'read'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { tenantId } = req.user!;
+
+    const opportunity = await prisma.opportunity.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: {
+        lead: { select: { id: true, firstName: true, lastName: true, email: true, phone: true } },
+        owner: { select: { id: true, firstName: true, lastName: true, email: true } },
+        creator: { select: { id: true, firstName: true, lastName: true } },
+        project: { select: { id: true, name: true } },
+        quotations: { select: { id: true, number: true, totalAmount: true, status: true } },
+        bookings: { select: { id: true, number: true, status: true, totalAmount: true } },
+        activities: { take: 10, orderBy: { createdAt: 'desc' } },
+        tasks: { take: 10, orderBy: { createdAt: 'desc' } },
+      },
+    });
+
+    if (!opportunity) {
+      return res.status(404).json({ success: false, error: 'Opportunity not found' });
+    }
+
+    res.json({ success: true, data: opportunity });
+  } catch (error) {
+    console.error('Get opportunity error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch opportunity' });
+  }
+});
+
+router.post('/', authorize('Opportunity', 'create'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { tenantId, id: userId } = req.user!;
+    const data = opportunitySchema.parse(req.body);
+
+    const opportunity = await prisma.opportunity.create({
+      data: {
+        tenantId,
+        name: data.name,
+        leadId: data.leadId,
+        ownerId: data.ownerId,
+        creatorId: userId,
+        queueId: data.queueId,
+        projectId: data.projectId,
+        stage: data.stage || 'PROSPECTING',
+        amount: data.amount,
+        expectedCloseDate: data.expectedCloseDate ? new Date(data.expectedCloseDate) : undefined,
+        probability: data.probability,
+        description: data.description,
+        lostReason: data.lostReason,
+      },
+      include: {
+        lead: { select: { id: true, firstName: true, lastName: true } },
+        owner: { select: { id: true, firstName: true, lastName: true } },
+      },
+    });
+
+    await auditLog(tenantId, userId, 'CREATE', 'Opportunity', opportunity.id, null, { name: data.name, stage: data.stage, amount: data.amount });
+
+    res.status(201).json({ success: true, data: opportunity });
+  } catch (error: any) {
+    if (error.name === 'ZodError') {
+      return res.status(400).json({ success: false, error: error.errors[0].message });
+    }
+    console.error('Create opportunity error:', error);
+    res.status(500).json({ success: false, error: 'Failed to create opportunity' });
+  }
+});
+
+router.put('/:id', authorize('Opportunity', 'edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { tenantId, id: userId } = req.user!;
+
+    const existing = await prisma.opportunity.findFirst({
+      where: { id: req.params.id, tenantId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Opportunity not found' });
+    }
+
+    const data = updateOpportunitySchema.parse(req.body);
+
+    const opportunity = await prisma.opportunity.update({
+      where: { id: req.params.id },
+      data: {
+        ...data,
+        expectedCloseDate: data.expectedCloseDate ? new Date(data.expectedCloseDate) : undefined,
+      },
+    });
+
+    await auditLog(tenantId, userId, 'UPDATE', 'Opportunity', opportunity.id, existing, opportunity);
+
+    res.json({ success: true, data: opportunity });
+  } catch (error: any) {
+    if (error.name === 'ZodError') {
+      return res.status(400).json({ success: false, error: error.errors[0].message });
+    }
+    console.error('Update opportunity error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update opportunity' });
+  }
+});
+
+router.patch('/:id/stage', authorize('Opportunity', 'edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { tenantId, id: userId } = req.user!;
+    const { stage, lostReason } = req.body;
+
+    const existing = await prisma.opportunity.findFirst({
+      where: { id: req.params.id, tenantId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Opportunity not found' });
+    }
+
+    const updateData: any = { stage };
+    if (stage === 'CLOSED_LOST' && lostReason) {
+      updateData.lostReason = lostReason;
+    }
+
+    const opportunity = await prisma.opportunity.update({
+      where: { id: req.params.id },
+      data: updateData,
+    });
+
+    await auditLog(tenantId, userId, 'UPDATE', 'Opportunity', opportunity.id, existing, { stage, lostReason });
+
+    res.json({ success: true, data: opportunity });
+  } catch (error) {
+    console.error('Update opportunity stage error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update opportunity stage' });
+  }
+});
+
+router.delete('/:id', authorize('Opportunity', 'delete'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { tenantId, id: userId } = req.user!;
+
+    const existing = await prisma.opportunity.findFirst({
+      where: { id: req.params.id, tenantId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Opportunity not found' });
+    }
+
+    await prisma.opportunity.delete({ where: { id: req.params.id } });
+
+    await auditLog(tenantId, userId, 'DELETE', 'Opportunity', existing.id, existing, null);
+
+    res.json({ success: true, data: null });
+  } catch (error) {
+    console.error('Delete opportunity error:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete opportunity' });
+  }
+});
+
+export default router;
