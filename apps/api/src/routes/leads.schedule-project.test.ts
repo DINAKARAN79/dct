@@ -1,0 +1,1098 @@
+import express from 'express';
+import type { Server } from 'http';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const database = vi.hoisted(() => ({
+  leadCreate: vi.fn(),
+  leadUpdate: vi.fn(),
+  leadFindFirst: vi.fn(),
+  leadFindMany: vi.fn(),
+  leadCount: vi.fn(),
+  leadFindUnique: vi.fn(),
+  followUpFindFirst: vi.fn(),
+  projectFindFirst: vi.fn(),
+  objectDefinitionFindFirst: vi.fn(),
+  objectDefinitionCreate: vi.fn(),
+  fieldDefinitionFindMany: vi.fn(),
+  fieldDefinitionFindFirst: vi.fn(),
+  fieldDefinitionAggregate: vi.fn(),
+  fieldDefinitionCreate: vi.fn(),
+  fieldDefinitionUpdate: vi.fn(),
+  picklistValueFindMany: vi.fn(),
+  picklistValueCreateMany: vi.fn(),
+  picklistValueUpdateMany: vi.fn(),
+  leadStatusSettingFindUnique: vi.fn(),
+  pageLayoutFindFirst: vi.fn(),
+  pageLayoutCreate: vi.fn(),
+  pageLayoutUpdate: vi.fn(),
+  auditLogCreate: vi.fn(),
+  auditLogFindFirst: vi.fn(),
+  userFindUnique: vi.fn(),
+  sequenceUpsert: vi.fn(),
+  siteVisitCreate: vi.fn(),
+  siteVisitFindUniqueOrThrow: vi.fn(),
+  transaction: vi.fn(),
+}));
+
+const rrQueue = vi.hoisted(() => ({
+  assignLeadInTransaction: vi.fn(),
+  findApplicableRRQueue: vi.fn(),
+  assignSiteVisitToSVCInTransaction: vi.fn(),
+}));
+
+const authState = vi.hoisted(() => ({
+  profileName: 'SVC',
+  userId: 'svc-a',
+}));
+
+vi.mock('@dct-crm/db', () => ({
+  prisma: {
+    lead: {
+      create: database.leadCreate,
+      update: database.leadUpdate,
+      findFirst: database.leadFindFirst,
+      findMany: database.leadFindMany,
+      count: database.leadCount,
+      findUnique: database.leadFindUnique,
+    },
+    followUp: { findFirst: database.followUpFindFirst },
+    objectDefinition: {
+      findFirst: database.objectDefinitionFindFirst,
+      create: database.objectDefinitionCreate,
+    },
+    fieldDefinition: {
+      findMany: database.fieldDefinitionFindMany,
+      findFirst: database.fieldDefinitionFindFirst,
+      aggregate: database.fieldDefinitionAggregate,
+      create: database.fieldDefinitionCreate,
+    },
+    picklistValue: {
+      findMany: database.picklistValueFindMany,
+      createMany: database.picklistValueCreateMany,
+      updateMany: database.picklistValueUpdateMany,
+    },
+    leadStatusSetting: { findUnique: database.leadStatusSettingFindUnique },
+    pageLayout: {
+      findFirst: database.pageLayoutFindFirst,
+      create: database.pageLayoutCreate,
+      update: database.pageLayoutUpdate,
+    },
+    auditLog: { findFirst: database.auditLogFindFirst },
+    project: { findFirst: database.projectFindFirst },
+    user: { findUnique: database.userFindUnique },
+    $transaction: database.transaction,
+  },
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authenticate: (req: any, _res: any, next: any) => {
+    req.user = {
+      id: authState.userId,
+      tenantId: 'tenant-a',
+      isSuperAdmin: false,
+      isAdmin: req.headers['x-test-admin'] === 'true',
+      profileName: authState.profileName,
+    };
+    req.tenantId = 'tenant-a';
+    next();
+  },
+}));
+
+vi.mock('../middleware/authorization', () => ({
+  authorize: () => (_req: any, _res: any, next: any) => next(),
+}));
+
+vi.mock('../services/leadPicklists', () => ({
+  getLeadPicklistOptions: vi.fn().mockResolvedValue(new Map([
+    ['source', new Set(['WEBSITE'])],
+  ])),
+  validateLeadPicklists: vi.fn().mockReturnValue(null),
+}));
+
+vi.mock('../services/workflow', () => ({
+  canTransitionStatus: () => true,
+  canScheduleSiteVisit: () => true,
+  canonicalProfileName: (name: string) =>
+    name.trim().toLowerCase().replace(/[\s_-]+/g, '') === 'presales' ? 'Presales' : name,
+  isValidStatus: () => true,
+}));
+
+vi.mock('../services/ownerHistory', () => ({
+  createOwnerHistory: vi.fn(),
+  getOwnerHistory: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock('../services/recordAccess', () => ({
+  canAccessLead: vi.fn().mockResolvedValue(true),
+  canEditLead: vi.fn().mockResolvedValue(true),
+  getLeadRecordScope: vi.fn(async (user: { isAdmin?: boolean; isSuperAdmin?: boolean; id: string }) =>
+    user.isAdmin || user.isSuperAdmin
+      ? { type: 'ALL' }
+      : { type: 'OWNER', userId: user.id }),
+  getHierarchyRecordScope: vi.fn().mockResolvedValue({ type: 'TEAM', userIds: ['svc-a', 'tm-a', 'tm-b'] }),
+  getRecordScope: vi.fn(async (user: { isAdmin?: boolean; isSuperAdmin?: boolean; id: string }) =>
+    user.isAdmin || user.isSuperAdmin
+      ? { type: 'ALL' }
+      : { type: 'OWNER', userId: user.id }),
+  leadScopeClause: vi.fn((scope: { type: 'ALL' | 'OWNER' | 'TEAM'; userId?: string; userIds?: string[] }) => {
+    if (scope.type === 'ALL') return null;
+    return { ownerId: { in: scope.type === 'OWNER' ? [scope.userId] : scope.userIds } };
+  }),
+}));
+
+vi.mock('../services/leadWorkflowExtras', () => ({
+  getNextSiteVisitNumber: vi.fn(),
+  normalizeOverdueFollowUps: vi.fn(),
+  normalizeOverdueSiteVisits: vi.fn(),
+}));
+vi.mock('../services/leadStatusSettings', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/leadStatusSettings')>();
+  return {
+    ...actual,
+    decorateLeadStatus: vi.fn((_tenantId: string, lead: unknown) => lead),
+    decorateLeads: vi.fn((leads: unknown[]) => leads),
+  };
+});
+vi.mock('../services/tenantTimezone', () => ({
+  getTenantTimezone: vi.fn().mockResolvedValue('UTC'),
+}));
+
+vi.mock('../services/rrQueue', () => ({
+  findApplicableRRQueue: rrQueue.findApplicableRRQueue,
+  assignLeadToProjectRoundRobinInTransaction: rrQueue.assignLeadInTransaction,
+  assignSiteVisitToSVCInTransaction: rrQueue.assignSiteVisitToSVCInTransaction,
+  hasLeadAssignmentRelevantChanges: vi.fn((updateData: Record<string, unknown>) =>
+    ['status', 'ownerId', 'source'].some((field) => Object.prototype.hasOwnProperty.call(updateData, field)),
+  ),
+  isLeadEligibleForAutoAssignment: () => true,
+  RoundRobinAssignmentService: {
+    assignLeadInTransaction: rrQueue.assignLeadInTransaction,
+  },
+}));
+
+vi.mock('../services/leadOwnerChange', () => ({
+  changeLeadOwner: vi.fn(),
+  getEligibleLeadOwners: vi.fn(),
+}));
+vi.mock('../services/leadNotes', () => ({
+  appendLeadProcessNote: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock('../services/effectivePermissions', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/effectivePermissions')>();
+  return {
+    ...actual,
+    EffectivePermissionService: {
+      ...actual.EffectivePermissionService,
+      getEffectivePermissionsCached: vi.fn().mockResolvedValue([{ name: 'LEAD_UPDATE' }]),
+      hasPermissionIn: vi.fn((permissions: Array<{ name: string }>, permission: string) =>
+        permissions.some((item) => item.name === permission),
+      ),
+    },
+  };
+});
+
+import { leadRoutes as leadsRouter } from './leads';
+
+const servers: Server[] = [];
+
+async function scheduleSiteVisit(body: Record<string, unknown>) {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads/lead-a/schedule-site-visit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+async function pushLeadToSVC(body: Record<string, unknown>) {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads/lead-a/push-to-svc`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+async function moveLeadToRecovery(body: Record<string, unknown>) {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads/lead-a/move-to-recovery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+async function updateLead(body: Record<string, unknown>) {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads/lead-a`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+async function getLead(identifier: string) {
+  const app = express();
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads/${encodeURIComponent(identifier)}`);
+}
+
+async function getLeadList(query = '', headers: Record<string, string> = {}) {
+  const app = express();
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads?page=1&limit=20${query}`, { headers });
+}
+
+async function createLead(body: Record<string, unknown>) {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  authState.profileName = 'SVC';
+  authState.userId = 'svc-a';
+  database.leadFindFirst.mockResolvedValue({
+    id: 'lead-a',
+    tenantId: 'tenant-a',
+    ownerId: 'svc-a',
+    creatorId: null,
+    status: 'PROSPECT',
+    owner: { id: 'svc-a', firstName: 'SVC', lastName: 'User' },
+  });
+  database.projectFindFirst.mockResolvedValue(null);
+  database.followUpFindFirst.mockResolvedValue(null);
+  database.objectDefinitionFindFirst.mockResolvedValue(null);
+  database.objectDefinitionCreate.mockResolvedValue({ id: 'lead-object-a' });
+  database.fieldDefinitionFindMany.mockResolvedValue([]);
+  database.fieldDefinitionFindFirst.mockResolvedValue(null);
+  database.fieldDefinitionAggregate.mockResolvedValue({ _max: { displayOrder: 10 } });
+  database.fieldDefinitionCreate.mockImplementation(({ data }: { data: { name: string; fieldType: string } }) => ({
+    id: `field-${data.name}`,
+    fieldType: data.fieldType,
+    isActive: true,
+    visible: true,
+    editable: true,
+  }));
+  database.picklistValueFindMany.mockResolvedValue([]);
+  database.picklistValueCreateMany.mockResolvedValue({ count: 1 });
+  database.leadStatusSettingFindUnique.mockResolvedValue(null);
+  database.pageLayoutFindFirst.mockResolvedValue(null);
+  database.pageLayoutCreate.mockResolvedValue({ id: 'lead-layout-a' });
+  database.pageLayoutUpdate.mockResolvedValue({});
+  database.auditLogCreate.mockResolvedValue({});
+  database.auditLogFindFirst.mockResolvedValue(null);
+  database.userFindUnique.mockResolvedValue({ firstName: 'Pre Sales', lastName: 'User' });
+  database.siteVisitCreate.mockResolvedValue({ id: 'site-visit-a' });
+  database.siteVisitFindUniqueOrThrow.mockResolvedValue({
+    id: 'site-visit-a',
+    assignee: { id: 'svc-a', firstName: 'SVC', lastName: 'User' },
+    project: { id: 'project-a', name: 'Project A' },
+  });
+  database.leadFindMany.mockResolvedValue([]);
+  database.leadCount.mockResolvedValue(1);
+  rrQueue.assignLeadInTransaction.mockResolvedValue({ assignedUserId: 'svc-member-a' });
+  rrQueue.assignSiteVisitToSVCInTransaction.mockResolvedValue({ assignedUserId: 'svc-member-a' });
+  database.transaction.mockImplementation((callback: (tx: unknown) => Promise<unknown>) =>
+    callback({
+      lead: {
+        create: database.leadCreate,
+        update: database.leadUpdate,
+        findFirst: database.leadFindFirst,
+        findMany: database.leadFindMany,
+        findUnique: database.leadFindUnique,
+        findUniqueOrThrow: database.leadFindUnique,
+      },
+      objectDefinition: {
+        findFirst: database.objectDefinitionFindFirst,
+        create: database.objectDefinitionCreate,
+      },
+      fieldDefinition: {
+        findMany: database.fieldDefinitionFindMany,
+        findFirst: database.fieldDefinitionFindFirst,
+        aggregate: database.fieldDefinitionAggregate,
+        create: database.fieldDefinitionCreate,
+        update: database.fieldDefinitionUpdate,
+      },
+      picklistValue: {
+        findMany: database.picklistValueFindMany,
+        createMany: database.picklistValueCreateMany,
+        updateMany: database.picklistValueUpdateMany,
+      },
+      pageLayout: {
+        findFirst: database.pageLayoutFindFirst,
+        create: database.pageLayoutCreate,
+        update: database.pageLayoutUpdate,
+      },
+      sequence: { upsert: database.sequenceUpsert },
+      auditLog: { create: database.auditLogCreate, findFirst: database.auditLogFindFirst },
+      project: { findFirst: database.projectFindFirst },
+      enquiry: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        findMany: vi.fn().mockResolvedValue([]),
+        create: vi.fn().mockResolvedValue({ id: 'enquiry-1' }),
+      },
+      tenant: { findUnique: vi.fn().mockResolvedValue(null) },
+      siteVisit: {
+        create: database.siteVisitCreate,
+        findUniqueOrThrow: database.siteVisitFindUniqueOrThrow,
+      },
+      $executeRaw: vi.fn().mockResolvedValue(1),
+      $queryRaw: vi.fn().mockResolvedValue([]),
+    }),
+  );
+  database.sequenceUpsert.mockResolvedValue({ nextValue: 1 });
+});
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  })));
+});
+
+describe('GET /api/leads/:id', () => {
+  it('resolves a public Lead Number and returns the canonical lead record', async () => {
+    const storedLead = {
+      id: 'lead-a',
+      leadNumber: 'LN000001',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      creatorId: null,
+      status: 'PROSPECT',
+      siteVisits: [],
+      auditLogs: [],
+    };
+    database.leadFindFirst.mockImplementation(async ({ where }: { where: Record<string, unknown> }) =>
+      where.leadNumber === 'LN000001' ? storedLead : null,
+    );
+
+    const response = await getLead('LN000001');
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      data: { id: 'lead-a', leadNumber: 'LN000001' },
+    });
+
+    expect(database.leadFindFirst).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ where: { id: 'LN000001', tenantId: 'tenant-a' } }),
+    );
+    expect(database.leadFindFirst).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ where: { leadNumber: 'LN000001', tenantId: 'tenant-a' } }),
+    );
+  });
+
+  it('resolves the Project from the Round Robin queue when the Lead has no Project', async () => {
+    database.leadFindFirst.mockResolvedValue({
+      id: 'lead-a',
+      leadNumber: 'LN000001',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      creatorId: null,
+      status: 'PROSPECT',
+      projectId: null,
+      project: null,
+      enquiries: [],
+      rrQueue: {
+        id: 'queue-a',
+        name: 'Valley',
+        project: { id: 'project-a', name: 'DCT Valley', tenantId: 'tenant-a' },
+      },
+      siteVisits: [],
+      auditLogs: [],
+    });
+
+    const response = await getLead('lead-a');
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      data: {
+        projectId: 'project-a',
+        project: { id: 'project-a', name: 'DCT Valley' },
+        rrQueue: { id: 'queue-a', name: 'Valley' },
+      },
+    });
+  });
+});
+
+describe('GET /api/leads team visibility', () => {
+  it('uses the role hierarchy and intersects owner filters in team mode', async () => {
+    const response = await getLeadList('&showMe=team&ownerId=tm-a');
+
+    expect(response.status).toBe(200);
+    expect(database.leadFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        AND: [{ ownerId: { in: ['svc-a', 'tm-a', 'tm-b'] } }],
+        ownerId: 'tm-a',
+      }),
+    }));
+    expect(database.leadCount).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        AND: [{ ownerId: { in: ['svc-a', 'tm-a', 'tm-b'] } }],
+        ownerId: 'tm-a',
+      }),
+    }));
+  });
+
+  it('lets admins request all leads but denies the same scope to ordinary users', async () => {
+    const denied = await getLeadList('&showMe=all');
+    expect(denied.status).toBe(403);
+    expect(database.leadFindMany).not.toHaveBeenCalled();
+
+    const admin = await getLeadList('&showMe=all', { 'x-test-admin': 'true' });
+    expect(admin.status).toBe(200);
+    expect(database.leadFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.not.objectContaining({ ownerId: expect.anything() }),
+    }));
+  });
+});
+
+describe('POST /api/leads email validation', () => {
+  it.each([
+    [{}, 'Email is required.'],
+    [{ email: 'not-an-email' }, 'Enter a valid email address.'],
+  ])('rejects invalid email input', async (body: Record<string, unknown>, message: string) => {
+    const response = await createLead(body);
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      success: false,
+      error: message,
+      fieldErrors: [{ field: 'email', message }],
+    });
+  });
+});
+
+describe('GET /api/leads', () => {
+  it('selects only available list fields when newer Lead columns are not migrated yet', async () => {
+    database.leadFindMany.mockResolvedValue([{
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      leadNumber: 'LN000001',
+      firstName: 'Test',
+      lastName: 'Lead',
+      company: null,
+      email: null,
+      phone: '9876543210',
+      countryCode: '91',
+      source: 'WEBSITE',
+      leadInterest: null,
+      status: 'PROSPECT',
+      rating: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+      owner: null,
+      project: null,
+      bookings: [],
+      _count: { siteVisits: 0, activities: 0 },
+    }]);
+
+    const response = await getLeadList();
+    const query = database.leadFindMany.mock.calls[0][0];
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      data: [{ id: 'lead-a', leadNumber: 'LN000001' }],
+      pagination: { total: 1 },
+    });
+    expect(query.select).toBeDefined();
+    expect(query.select.bookedBy).toBeUndefined();
+    expect(query.include).toBeUndefined();
+  });
+});
+
+describe('POST /api/leads/:id/push-to-svc request validation', () => {
+  it.each([
+    [{ reason: '   ' }, 'Reason/note is required for status change'],
+    [{ reason: 42 }, 'Expected string, received number'],
+    [{ reason: 'x'.repeat(2001) }, 'Reason/note must be 2000 characters or fewer'],
+  ])('rejects an invalid SVC push note: %j', async (body, expectedError) => {
+    const response = await pushLeadToSVC(body);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ success: false, error: expectedError });
+    expect(database.leadFindFirst).not.toHaveBeenCalled();
+    expect(database.transaction).not.toHaveBeenCalled();
+  });
+
+  it('creates missing Prospect Lead fields and saves the submitted details during SVC assignment', async () => {
+    database.leadFindFirst.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'crm-a',
+      creatorId: 'crm-a',
+      status: 'INCOMING',
+      projectId: 'old-project',
+      customFields: { existingField: 'keep me' },
+      owner: { id: 'crm-a', firstName: 'CRM', lastName: 'User' },
+    });
+
+    database.projectFindFirst.mockResolvedValueOnce({ id: 'project-a' });
+    database.leadFindUnique.mockResolvedValueOnce({ id: 'lead-a', status: 'PROSPECT' });
+    database.fieldDefinitionFindMany.mockResolvedValueOnce([
+      { name: 'firstName', displayOrder: 1 },
+      { name: 'company', displayOrder: 2 },
+    ]);
+    const details = {
+      callSummaryRemarks: 'Customer is interested in a family home',
+      minimumBudget: '50 lakhs',
+      maximumBudget: '1 crore',
+      bedroomPreference: ['3 BHK', '4 BHK'],
+      propertyType: ['Apartment', 'Villa'],
+      possession: 'Within 6 Months',
+      reasonToBuy: 'Self Use',
+    };
+
+    const response = await pushLeadToSVC({
+      reason: details.callSummaryRemarks,
+      projectId: 'project-a',
+      prospectDetails: details,
+    });
+
+    expect(response.status).toBe(200);
+    expect(rrQueue.assignLeadInTransaction).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      projectId: 'project-a',
+      userType: 'SVC',
+    }));
+    expect(database.fieldDefinitionCreate).toHaveBeenCalledTimes(7);
+    expect(database.picklistValueCreateMany).toHaveBeenCalledTimes(6);
+    expect(database.pageLayoutCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        name: 'Default Lead Layout',
+        isDefault: true,
+        sections: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'Lead Information',
+            fields: expect.arrayContaining(['firstName', 'company']),
+          }),
+          expect.objectContaining({
+            name: 'Prospect Information',
+            fields: expect.arrayContaining([
+              'svc_call_summary_remarks',
+              'svc_minimum_budget',
+              'svc_maximum_budget',
+              'svc_bedroom_preference',
+              'svc_property_type',
+              'svc_possession',
+              'svc_reason_to_buy',
+            ]),
+          }),
+        ]),
+      }),
+    }));
+    expect(database.leadUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        projectId: 'project-a',
+        status: 'PROSPECT',
+        customFields: expect.objectContaining({
+          existingField: 'keep me',
+          svc_call_summary_remarks: details.callSummaryRemarks,
+          svc_minimum_budget: details.minimumBudget,
+          svc_maximum_budget: details.maximumBudget,
+          svc_bedroom_preference: details.bedroomPreference,
+          svc_property_type: details.propertyType,
+          svc_possession: details.possession,
+          svc_reason_to_buy: details.reasonToBuy,
+        }),
+      }),
+    }));
+  });
+
+  it('rejects SVC push while the Lead has an active scheduled Follow-Up', async () => {
+    database.leadFindFirst.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      creatorId: 'svc-a',
+      status: 'INCOMING',
+      owner: { id: 'svc-a', firstName: 'SVC', lastName: 'User' },
+    });
+    database.followUpFindFirst.mockResolvedValueOnce({ id: 'follow-up-a' });
+
+    const response = await pushLeadToSVC({
+      reason: 'Interested',
+      projectId: 'project-a',
+      prospectDetails: {
+        callSummaryRemarks: 'Interested',
+        minimumBudget: '50 lakhs',
+        maximumBudget: '1 crore',
+        bedroomPreference: ['3 BHK'],
+        propertyType: ['Apartment'],
+      },
+    });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      success: false,
+      error: 'Push notification is not available for Scheduled Follow-Ups. Please use the Schedule option.',
+    });
+    expect(database.followUpFindFirst).toHaveBeenCalledWith({
+      where: {
+        tenantId: 'tenant-a',
+        leadId: 'lead-a',
+        status: 'SCHEDULED',
+        isCompleted: false,
+        isMissed: false,
+        isSystemCancelled: false,
+      },
+      select: { id: true },
+    });
+    expect(database.projectFindFirst).not.toHaveBeenCalled();
+    expect(database.transaction).not.toHaveBeenCalled();
+    expect(database.leadUpdate).not.toHaveBeenCalled();
+  });
+
+  it('adds unconfigured visible Lead fields to an existing default layout', async () => {
+    database.leadFindFirst.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'crm-a',
+      creatorId: 'crm-a',
+      status: 'INCOMING',
+      owner: { id: 'crm-a', firstName: 'CRM', lastName: 'User' },
+    });
+    database.projectFindFirst.mockResolvedValueOnce({ id: 'project-a' });
+    database.leadFindUnique.mockResolvedValueOnce({ id: 'lead-a', status: 'PROSPECT' });
+    database.fieldDefinitionFindMany.mockResolvedValueOnce([
+      { name: 'firstName', displayOrder: 1 },
+      { name: 'company', displayOrder: 2 },
+    ]);
+    database.pageLayoutFindFirst.mockResolvedValueOnce({
+      id: 'lead-layout-a',
+      sections: [{ name: 'Lead Information', fields: [] }, { name: 'Details', fields: [] }],
+    });
+
+    const response = await pushLeadToSVC({
+      reason: 'Interested in a family home',
+      projectId: 'project-a',
+      prospectDetails: {
+        callSummaryRemarks: 'Interested in a family home',
+        minimumBudget: '50 lakhs',
+        maximumBudget: '1 crore',
+        bedroomPreference: ['3 BHK'],
+        propertyType: ['Apartment'],
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(database.pageLayoutUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'lead-layout-a' },
+      data: {
+        sections: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'Lead Information',
+            fields: expect.arrayContaining(['firstName', 'company']),
+          }),
+          expect.objectContaining({
+            name: 'Prospect Information',
+            fields: expect.arrayContaining(['svc_call_summary_remarks', 'svc_minimum_budget']),
+          }),
+        ]),
+      },
+    }));
+  });
+
+  it('rejects a project that does not belong to the Lead tenant', async () => {
+    database.leadFindFirst.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      status: 'INCOMING',
+      projectId: null,
+      owner: null,
+    });
+    database.projectFindFirst.mockResolvedValueOnce(null);
+
+    const response = await pushLeadToSVC({
+      reason: 'Qualified',
+      projectId: 'project-other-tenant',
+      prospectDetails: {
+        callSummaryRemarks: 'Qualified',
+        minimumBudget: '50 lakhs',
+        maximumBudget: '1 crore',
+        bedroomPreference: ['3 BHK'],
+        propertyType: ['Apartment'],
+      },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ success: false, error: 'Project must belong to this company' });
+    expect(database.transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('PUT /api/leads/:id owner protection', () => {
+  it('rejects owner changes through the generic edit route', async () => {
+    const response = await updateLead({ ownerId: 'other-user' });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({
+      success: false,
+      error: 'Use the lead assignment action to change the owner.',
+    });
+    expect(database.leadUpdate).not.toHaveBeenCalled();
+    expect(database.transaction).not.toHaveBeenCalled();
+  });
+
+  it('updates a project without running Round Robin or changing the owner', async () => {
+    database.leadUpdate.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      projectId: 'project-new',
+      status: 'PROSPECT',
+    });
+
+    const response = await updateLead({ projectId: 'project-new' });
+
+    expect(response.status).toBe(200);
+    expect(database.leadUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ projectId: 'project-new' }),
+    }));
+    expect(rrQueue.findApplicableRRQueue).not.toHaveBeenCalled();
+    expect(rrQueue.assignLeadInTransaction).not.toHaveBeenCalled();
+  });
+
+  it('does not reassign when a project change is submitted with other editable fields', async () => {
+    database.leadUpdate.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      projectId: 'project-new',
+      status: 'PROSPECT',
+      source: 'WEBSITE',
+    });
+
+    const response = await updateLead({ projectId: 'project-new', source: 'WEBSITE' });
+
+    expect(response.status).toBe(200);
+    expect(rrQueue.findApplicableRRQueue).not.toHaveBeenCalled();
+    expect(rrQueue.assignLeadInTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/leads/:id/schedule-site-visit project validation', () => {
+  it('creates a visit assigned to its creator without requiring an SVC round-robin queue', async () => {
+    database.leadFindFirst.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      status: 'SITE_VISIT_HAPPENED',
+      owner: { id: 'svc-a', firstName: 'SVC', lastName: 'User' },
+    });
+    database.projectFindFirst.mockResolvedValueOnce({ id: 'project-a' });
+
+    const response = await scheduleSiteVisit({
+      projectId: 'project-a',
+      scheduledAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      visitType: 'Site Visit',
+      rating: null,
+      transport: null,
+      callSummaryRemarks: 'Follow-up visit',
+      minimumBudget: '20 lakhs',
+      maximumBudget: '30 lakhs',
+      propertyType: ['Apartment'],
+      bedroomPreference: ['3 BHK'],
+    });
+
+    expect(response.status).toBe(200);
+    expect(database.siteVisitCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        creatorId: 'svc-a',
+        assigneeId: 'svc-a',
+        leadId: 'lead-a',
+      }),
+    }));
+    expect(database.leadUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      data: { status: 'SITE_VISIT_SCHEDULED', lostAt: null },
+    }));
+  });
+
+  it('sends Pre-Sales scheduled visits through SVC round robin without replacing the scheduler', async () => {
+    authState.profileName = 'Pre Sales';
+    authState.userId = 'presales-a';
+    database.leadFindFirst.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'presales-a',
+      status: 'PROSPECT',
+      owner: { id: 'presales-a', firstName: 'Pre Sales', lastName: 'User' },
+    });
+    database.projectFindFirst.mockResolvedValueOnce({ id: 'project-a' });
+
+    const response = await scheduleSiteVisit({
+      projectId: 'project-a',
+      scheduledAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      visitType: 'Site Visit',
+      rating: null,
+      transport: null,
+      callSummaryRemarks: 'Follow-up visit',
+      minimumBudget: '20 lakhs',
+      maximumBudget: '30 lakhs',
+      propertyType: ['Apartment'],
+      bedroomPreference: ['3 BHK'],
+    });
+    const siteVisitData = database.siteVisitCreate.mock.calls[0][0].data;
+
+    expect(response.status).toBe(200);
+    expect(siteVisitData).toMatchObject({
+      creatorId: 'presales-a',
+      leadId: 'lead-a',
+    });
+    expect(siteVisitData).not.toHaveProperty('assigneeId');
+    expect(rrQueue.assignSiteVisitToSVCInTransaction).toHaveBeenCalledWith(
+      expect.any(Object),
+      { siteVisitId: 'site-visit-a', tenantId: 'tenant-a', actorId: 'presales-a' },
+    );
+    expect(database.siteVisitCreate.mock.invocationCallOrder[0])
+      .toBeLessThan(rrQueue.assignSiteVisitToSVCInTransaction.mock.invocationCallOrder[0]);
+  });
+
+  it('rejects a project outside the authenticated tenant before assignment or creation', async () => {
+    const response = await scheduleSiteVisit({
+      projectId: 'project-from-tenant-b',
+      scheduledAt: '2027-06-15T09:00:00.000Z',
+      visitType: 'Site Visit',
+      rating: null,
+      transport: null,
+      callSummaryRemarks: '',
+      minimumBudget: '20 lakhs',
+      maximumBudget: '30 lakhs',
+      propertyType: ['Apartment'],
+      bedroomPreference: ['3 BHK'],
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(404);
+    expect(body).toMatchObject({ success: false, error: 'Project not found' });
+    expect(database.projectFindFirst).toHaveBeenCalledWith({
+      where: { id: 'project-from-tenant-b', tenantId: 'tenant-a', isActive: true },
+      select: { id: true },
+    });
+  });
+
+  it('rejects a past visit time before creating a site visit', async () => {
+    database.projectFindFirst.mockResolvedValueOnce({ id: 'project-a' });
+    const response = await scheduleSiteVisit({
+      projectId: 'project-a',
+      scheduledAt: '2020-01-01T09:00:00.000Z',
+      visitType: 'Site Visit',
+      rating: 'Hot',
+      transport: 'Self',
+      callSummaryRemarks: '',
+      minimumBudget: '20 lakhs',
+      maximumBudget: '30 lakhs',
+      propertyType: ['Apartment'],
+      bedroomPreference: [],
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(body).toMatchObject({ success: false, error: 'Site visit can only be scheduled for a future date and time.' });
+    expect(database.transaction).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed visit dates before starting a transaction', async () => {
+    const response = await scheduleSiteVisit({
+      projectId: 'project-a',
+      notes: 'Customer requested a visit',
+      scheduledAt: 'not-a-date',
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(body).toMatchObject({ success: false, error: 'Visit date/time is required' });
+    expect(database.transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/leads Round Robin assignment', () => {
+  it('creates the lead when a matching queue has no eligible Sales user and reports the pending assignment', async () => {
+    const createdLead = {
+      id: 'lead-new',
+      leadNumber: 'LN000001',
+      firstName: 'New',
+      lastName: 'Customer',
+      company: 'Example',
+      source: 'WEBSITE',
+      projectId: 'project-a',
+      project: { id: 'project-a', name: 'Project A' },
+      owner: { id: 'admin-a', firstName: 'Admin', lastName: 'User' },
+    };
+    database.leadCreate.mockResolvedValue(createdLead);
+    database.leadFindUnique.mockResolvedValue(createdLead);
+    database.projectFindFirst.mockResolvedValue({ id: 'project-a', name: 'Project A' });
+    rrQueue.findApplicableRRQueue.mockResolvedValue({ id: 'queue-a' });
+    rrQueue.assignLeadInTransaction.mockRejectedValue(new Error('NO_ELIGIBLE_USER'));
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/leads', leadsRouter);
+    const server = app.listen(0);
+    servers.push(server);
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/leads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lastName: 'Customer',
+        company: 'Example',
+        phone: '9876543210',
+        email: 'customer@example.com',
+        source: 'WEBSITE',
+        projectName: 'Project A',
+      }),
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(201);
+    expect(database.leadCreate).toHaveBeenCalledOnce();
+    expect(database.projectFindFirst).toHaveBeenCalledWith({
+      where: { tenantId: 'tenant-a', name: 'Project A', isActive: true },
+      select: { id: true },
+    });
+    expect(database.leadCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ projectId: 'project-a' }),
+    }));
+    expect(body).toMatchObject({
+      success: true,
+      data: {
+        id: 'lead-new',
+        assignmentWarning: expect.stringContaining('no eligible Sales user'),
+      },
+    });
+  });
+
+  it('rejects a project name that is not active in the authenticated company', async () => {
+    database.projectFindFirst.mockResolvedValue(null);
+
+    const response = await createLead({
+      lastName: 'Customer',
+      company: 'Example',
+      phone: '9876543210',
+      email: 'customer@example.com',
+      projectName: 'Other Company Project',
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      success: false,
+      error: 'Project name must match an active project in this company.',
+    });
+    expect(database.leadCreate).not.toHaveBeenCalled();
+  });
+
+  describe('POST /api/leads/:id/move-to-recovery', () => {
+    it('records the recovery date, reason, and acting user in the Unqualified fields', async () => {
+      database.leadFindFirst.mockResolvedValue({
+        id: 'lead-a',
+        tenantId: 'tenant-a',
+        ownerId: 'presales-a',
+        creatorId: 'presales-a',
+        status: 'PROSPECT',
+        projectId: 'project-a',
+        customFields: { existingField: 'keep me' },
+        owner: { id: 'presales-a', firstName: 'Pre Sales', lastName: 'User' },
+      });
+      database.leadFindUnique.mockResolvedValue({ id: 'lead-a', status: 'LOST' });
+
+      const response = await moveLeadToRecovery({
+        recoveryReason: 'Budget Issue',
+        note: 'Customer paused the purchase',
+      });
+
+      expect(response.status).toBe(200);
+      const updateData = database.leadUpdate.mock.calls[0][0].data;
+      expect(updateData).toMatchObject({
+        status: 'LOST',
+        customFields: {
+          existingField: 'keep me',
+          sf_Unqualified_Reason__c: 'Budget Issue',
+          sf_Unqualified_Lost_By__c: 'Pre Sales User',
+        },
+      });
+      expect(updateData.lostAt).toBeInstanceOf(Date);
+      expect(updateData.customFields.sf_Unqualified_Date__c).toBe(updateData.lostAt.toISOString());
+      expect(database.auditLogCreate).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          newValues: expect.objectContaining({
+            Unqualified_Reason__c: 'Budget Issue',
+            Unqualified_Lost_By__c: 'Pre Sales User',
+          }),
+        }),
+      }));
+    });
+  });
+
+  it('rejects a direct status-bar update without writing the lead', async () => {
+    const app = express();
+    app.use(express.json());
+    app.use('/api/leads', leadsRouter);
+    const server = app.listen(0);
+    servers.push(server);
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/leads/lead-a/status`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ statusId: '3', note: 'Clicked the status bar' }),
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(403);
+    expect(body).toMatchObject({
+      success: false,
+      error: 'Lead status cannot be changed from the status bar.',
+    });
+    expect(database.leadUpdate).not.toHaveBeenCalled();
+    expect(database.transaction).not.toHaveBeenCalled();
+  });
+});

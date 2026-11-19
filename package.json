@@ -1,0 +1,49 @@
+{
+  "name": "dct-crm",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:web\" \"npm run dev:api\" \"npm run dev:ai\" \"npm run dev:cp-portal\"",
+    "dev:web": "cd apps/web && ../../node_modules/.bin/next dev",
+    "dev:api": "cd apps/api && ../../node_modules/.bin/tsx watch src/index.ts",
+    "dev:ai": "cd apps/ai && python3 -m uvicorn main:app --reload --port 8001",
+    "dev:cp-portal": "cd apps/portal && BACKEND_URL=http://127.0.0.1:3001 ../../node_modules/.bin/next dev --port 3002",
+    "build": "npm run build --workspaces --if-present",
+    "build:web": "npm run build --workspace=apps/web",
+    "build:api": "npm run build --workspace=apps/api",
+    "lint": "npm run lint --workspaces --if-present",
+    "lint:web": "npm run lint --workspace=apps/web",
+    "lint:api": "npm run lint --workspace=apps/api",
+    "test": "npm run test --workspaces --if-present",
+    "test:web": "npm run test --workspace=apps/web",
+    "test:api": "npm run test --workspace=apps/api",
+    "db:generate": "npm run db:generate --workspace=packages/db",
+    "db:push": "npm run db:push --workspace=packages/db",
+    "db:migrate": "npm run db:migrate --workspace=packages/db",
+    "db:seed": "npm run db:seed --workspace=packages/db",
+    "db:seed-super-admin": "npm run db:seed-super-admin --workspace=packages/db",
+    "db:seed:standard-metadata": "npm run db:seed-lead-fields --workspace=packages/db && npm run db:seed-salesforce-fields --workspace=packages/db && npm run db:seed-unit-fields --workspace=packages/db",
+    "db:studio": "npm run db:studio --workspace=packages/db",
+    "db:repair-telephony": "node scripts/telephony-db-sql.mjs repair",
+    "postdeploy:check-telephony": "sh scripts/check-telephony-permission.sh",
+    "postdeploy:check-permissions": "node scripts/telephony-db-sql.mjs check-admin-permissions",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "allowScripts": {
+    "@prisma/client@5.22.0": true,
+    "@prisma/engines@5.22.0": true,
+    "bcrypt@6.0.0": true,
+    "esbuild@0.21.5": true,
+    "esbuild@0.28.2": true,
+    "prisma@5.22.0": true,
+    "unrs-resolver@1.12.2": true,
+    "fsevents@2.3.3": true
+  }
+}
